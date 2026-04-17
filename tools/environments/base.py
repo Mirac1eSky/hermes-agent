@@ -353,6 +353,58 @@ class BaseEnvironment(ABC):
     # Command wrapping
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _needs_background_detach(cmd: str) -> bool:
+        """Check if the command launches a background process that needs full
+        session detachment to survive the parent shell's timeout.
+
+        When npm exec / npx forks a long-running server (e.g. vite,
+        webpack-dev-server), the parent bash can get stuck in kernel_wait4
+        if killed before the fork chain completes.  Returning True here
+        causes the command to be wrapped in a detached subshell.
+        """
+        stripped = cmd.strip()
+        if stripped.endswith("&"):
+            return True
+        if stripped.startswith("nohup ") or " && nohup " in cmd or "; nohup " in cmd:
+            return True
+        if stripped.startswith("setsid ") or " && setsid " in cmd or "; setsid " in cmd:
+            return True
+        return False
+
+    @staticmethod
+    def _wrap_for_background_detach(cmd: str) -> str:
+        """Wrap a background command in a subshell with stdin closed.
+
+        Transforms ``nohup cmd &`` → ``( cmd ) </dev/null &`` so that:
+
+        - The subshell ``(...)`` runs the command in a child process.
+        - ``</dev/null`` closes stdin, preventing pipe-fd inheritance that
+          can block the parent from returning.
+        - ``&`` backgrounds the subshell, so bash returns immediately
+          without waiting for the subshell's children.
+        """
+        stripped = cmd.strip()
+
+        # Already using setsid at the top level — just close stdin
+        if stripped.startswith("setsid ") and stripped.endswith("&"):
+            return f"{stripped} </dev/null"
+
+        # Extract the part before the trailing &
+        if stripped.endswith("&"):
+            inner = stripped[:-1].strip()
+        else:
+            inner = stripped
+
+        # Strip leading nohup (subshell + </dev/null replaces it)
+        if inner.startswith("nohup "):
+            inner = inner[len("nohup "):].strip()
+
+        # Also strip nohup after && or ;
+        inner = inner.replace("&& nohup ", "&& ").replace("; nohup ", "; ")
+
+        return f"( {inner} ) </dev/null &"
+
     def _wrap_command(self, command: str, cwd: str) -> str:
         """Build the full bash script that sources snapshot, cd's, runs command,
         re-dumps env vars, and emits CWD markers."""
@@ -370,8 +422,13 @@ class BaseEnvironment(ABC):
         )
         parts.append(f"cd {quoted_cwd} || exit 126")
 
-        # Run the actual command
-        parts.append(f"eval '{escaped}'")
+        # Run the actual command, with background detach if needed
+        if self._needs_background_detach(command):
+            detached = self._wrap_for_background_detach(command)
+            escaped_detached = detached.replace("'", "'\\''")
+            parts.append(f"eval '{escaped_detached}'")
+        else:
+            parts.append(f"eval '{escaped}'")
         parts.append("__hermes_ec=$?")
 
         # Re-dump env vars to snapshot (last-writer-wins for concurrent calls)
