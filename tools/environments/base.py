@@ -442,14 +442,24 @@ class BaseEnvironment(ABC):
         """
         output_chunks: list[str] = []
         _stop_drain = threading.Event()
+        # Incremental decoder to avoid splitting multibyte characters
+        # across chunk boundaries (copilot review feedback)
+        encoding = getattr(proc.stdout, "encoding", "utf-8") or "utf-8"
+        _decoder_cls = __import__("codecs").getincrementaldecoder(encoding)
+        _decoder = _decoder_cls(errors="replace")
 
         def _drain():
-            """Drain stdout using select() so the loop is interruptible."""
+            """Drain stdout using select() so the loop is interruptible.
+
+            On stop signal, flush any remaining bytes still available in the
+            pipe so output is not lost (copilot review feedback).
+            """
             try:
                 fd = proc.stdout.fileno()
-                while not _stop_drain.is_set():
+                while True:
+                    select_timeout = 0.0 if _stop_drain.is_set() else 0.3
                     try:
-                        ready, _, _ = select.select([fd], [], [], 0.3)
+                        ready, _, _ = select.select([fd], [], [], select_timeout)
                     except (ValueError, OSError):
                         break
                     if ready:
@@ -457,14 +467,16 @@ class BaseEnvironment(ABC):
                             data = os.read(fd, 4096)
                             if not data:
                                 break
-                            output_chunks.append(data.decode("utf-8", errors="replace"))
+                            output_chunks.append(_decoder.decode(data))
                         except OSError:
                             break
-            except UnicodeDecodeError:
-                output_chunks.clear()
-                output_chunks.append(
-                    "[binary output detected — raw bytes not displayable]"
-                )
+                    elif _stop_drain.is_set():
+                        # No more data available after stop signal — done
+                        break
+                # Flush any remaining buffered bytes in the incremental decoder
+                remaining = _decoder.decode(b"", final=True)
+                if remaining:
+                    output_chunks.append(remaining)
             except (ValueError, OSError):
                 pass
 
