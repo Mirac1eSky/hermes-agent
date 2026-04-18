@@ -519,7 +519,12 @@ class BaseEnvironment(ABC):
                             _tid, _pid, _iter_count, time.monotonic() - _activity_state["start"],
                         )
                     self._kill_process(proc)
+                    _stop_drain.set()
                     drain_thread.join(timeout=2)
+                    try:
+                        proc.stdout.close()
+                    except Exception:
+                        pass
                     return {
                         "output": "".join(output_chunks) + "\n[Command interrupted]",
                         "returncode": 130,
@@ -532,7 +537,12 @@ class BaseEnvironment(ABC):
                             _tid, _pid, _iter_count, timeout,
                         )
                     self._kill_process(proc)
+                    _stop_drain.set()
                     drain_thread.join(timeout=2)
+                    try:
+                        proc.stdout.close()
+                    except Exception:
+                        pass
                     partial = "".join(output_chunks)
                     timeout_msg = f"\n[Command timed out after {timeout}s]"
                     return {
@@ -582,29 +592,13 @@ class BaseEnvironment(ABC):
                 self._kill_process(proc)
                 _stop_drain.set()
                 drain_thread.join(timeout=2)
+                try:
+                    proc.stdout.close()
+                except Exception:
+                    pass
             except Exception:
                 pass  # cleanup is best-effort
             raise
-        if time.monotonic() > deadline:
-            self._kill_process(proc)
-            _stop_drain.set()
-            drain_thread.join(timeout=2)
-            try:
-                proc.stdout.close()
-            except Exception:
-                pass
-            partial = "".join(output_chunks)
-            timeout_msg = f"\n[Command timed out after {timeout}s]"
-            return {
-                "output": partial + timeout_msg
-                if partial
-                else timeout_msg.lstrip(),
-                "returncode": 124,
-            }
-        # Periodic activity touch so the gateway knows we're alive
-        touch_activity_if_due(_activity_state, "terminal command running")
-        time.sleep(0.2)
-
         # Process exited normally — signal drain thread and close stdout
         # so the pipe EOF propagates even if background children hold it.
         _stop_drain.set()
