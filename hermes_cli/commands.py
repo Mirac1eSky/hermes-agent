@@ -94,6 +94,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("steer", "Inject a message after the next tool call without interrupting", "Session",
                args_hint="<prompt>"),
     CommandDef("status", "Show session info", "Session"),
+    CommandDef("list", "List recent sessions", "Session",
+               gateway_only=True, args_hint="[limit]"),
     CommandDef("profile", "Show active profile name and home directory", "Info"),
     CommandDef("sethome", "Set this chat as the home channel", "Session",
                gateway_only=True, aliases=("set-home",)),
