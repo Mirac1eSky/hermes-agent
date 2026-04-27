@@ -379,6 +379,23 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception:
             pass
 
+        # Drain stale connections before reconnecting.
+        # Network errors (especially through a proxy like sing-box) can leave httpx
+        # connections in a half-closed state that still occupy slots in the
+        # connection pool. Shutting down the bot releases all pool connections,
+        # then re-initializing creates fresh ones for the new polling session.
+        if self._app and self._app.bot:
+            try:
+                await self._app.bot.shutdown()
+                logger.debug("[%s] Bot request objects shut down before reconnect", self.name)
+            except Exception:
+                pass
+            try:
+                await self._app.bot.initialize()
+                logger.debug("[%s] Bot request objects re-initialized for reconnect", self.name)
+            except Exception:
+                pass
+
         try:
             await self._app.updater.start_polling(
                 allowed_updates=Update.ALL_TYPES,

@@ -160,3 +160,116 @@ async def test_reconnect_triggers_fatal_after_max_retries():
     assert adapter.has_fatal_error
     assert adapter.fatal_error_code == "telegram_network_error"
     fatal_handler.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_drains_stale_connections():
+    """
+    During reconnect, the bot's request objects must be shut down and
+    re-initialized to release any connections stuck in the httpx pool.
+
+    Without this, proxy-related network errors leave half-closed connections
+    that occupy pool slots, eventually causing PoolTimeout.
+    """
+    adapter = _make_adapter()
+    adapter._polling_network_error_count = 1
+
+    mock_bot = AsyncMock()
+    mock_bot.shutdown = AsyncMock()
+    mock_bot.initialize = AsyncMock()
+
+    mock_updater = MagicMock()
+    mock_updater.running = True
+    mock_updater.stop = AsyncMock()
+    mock_updater.start_polling = AsyncMock()  # succeeds
+
+    mock_app = MagicMock()
+    mock_app.updater = mock_updater
+    mock_app.bot = mock_bot
+    adapter._app = mock_app
+
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        await adapter._handle_polling_network_error(Exception("Bad Gateway"))
+
+    # Bot must be shut down and re-initialized before start_polling
+    mock_bot.shutdown.assert_called_once()
+    mock_bot.initialize.assert_called_once()
+
+    # The order matters: shutdown → initialize → start_polling
+    call_order = []
+    for call in mock_bot.shutdown.mock_calls:
+        call_order.append("shutdown")
+    for call in mock_updater.stop.mock_calls:
+        call_order.append("stop")
+    for call in mock_bot.initialize.mock_calls:
+        call_order.append("initialize")
+    for call in mock_updater.start_polling.mock_calls:
+        call_order.append("start_polling")
+
+    assert "shutdown" in call_order
+    assert "initialize" in call_order
+    assert call_order.index("shutdown") < call_order.index("start_polling")
+    assert call_order.index("initialize") < call_order.index("start_polling")
+
+
+@pytest.mark.asyncio
+async def test_reconnect_continues_if_bot_shutdown_fails():
+    """
+    If bot.shutdown() raises during reconnect, we should still attempt
+    start_polling — don't let one failure block the entire recovery.
+    """
+    adapter = _make_adapter()
+    adapter._polling_network_error_count = 1
+
+    mock_bot = AsyncMock()
+    mock_bot.shutdown = AsyncMock(side_effect=Exception("shutdown failed"))
+    mock_bot.initialize = AsyncMock()
+
+    mock_updater = MagicMock()
+    mock_updater.running = True
+    mock_updater.stop = AsyncMock()
+    mock_updater.start_polling = AsyncMock()  # succeeds
+
+    mock_app = MagicMock()
+    mock_app.updater = mock_updater
+    mock_app.bot = mock_bot
+    adapter._app = mock_app
+
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        await adapter._handle_polling_network_error(Exception("Bad Gateway"))
+
+    # start_polling should still be called despite shutdown failure
+    mock_updater.start_polling.assert_called_once()
+    # Error count should still reset (reconnect succeeded)
+    assert adapter._polling_network_error_count == 0
+
+
+@pytest.mark.asyncio
+async def test_reconnect_continues_if_bot_initialize_fails():
+    """
+    If bot.initialize() raises during reconnect, we should still attempt
+    start_polling — the existing connection pool may still be usable.
+    """
+    adapter = _make_adapter()
+    adapter._polling_network_error_count = 1
+
+    mock_bot = AsyncMock()
+    mock_bot.shutdown = AsyncMock()
+    mock_bot.initialize = AsyncMock(side_effect=Exception("init failed"))
+
+    mock_updater = MagicMock()
+    mock_updater.running = True
+    mock_updater.stop = AsyncMock()
+    mock_updater.start_polling = AsyncMock()  # succeeds
+
+    mock_app = MagicMock()
+    mock_app.updater = mock_updater
+    mock_app.bot = mock_bot
+    adapter._app = mock_app
+
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        await adapter._handle_polling_network_error(Exception("Bad Gateway"))
+
+    # start_polling should still be called despite init failure
+    mock_updater.start_polling.assert_called_once()
+    assert adapter._polling_network_error_count == 0
