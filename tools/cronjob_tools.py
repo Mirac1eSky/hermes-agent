@@ -329,8 +329,82 @@ def cronjob(
             return json.dumps({"success": True, "job": _format_job(updated)}, indent=2)
 
         if normalized in {"run", "run_now", "trigger"}:
-            updated = trigger_job(job_id)
-            return json.dumps({"success": True, "job": _format_job(updated)}, indent=2)
+            job = get_job(job_id)
+            if not job:
+                return tool_error(f"Job {job_id} not found", success=False)
+
+            import fcntl
+            from cron.scheduler import _LOCK_DIR, _LOCK_FILE, run_job
+            from cron.jobs import mark_job_run, save_job_output
+            from hermes_time import now as _hermes_now
+
+            _LOCK_DIR.mkdir(parents=True, exist_ok=True)
+
+            # Check whether the gateway is running — if so, wake its ticker
+            # for near-immediate execution; otherwise execute synchronously.
+            from gateway.status import get_running_pid
+            gateway_pid = get_running_pid()
+
+            if gateway_pid:
+                # ── Gateway mode: update DB + wake ticker, return immediately ──
+                with open(_LOCK_FILE, "w") as _lock_fd:
+                    fcntl.flock(_lock_fd, fcntl.LOCK_EX)
+                    update_job(job_id, {
+                        "next_run_at": _hermes_now().isoformat(),
+                        "enabled": True,
+                        "state": "scheduled",
+                        "paused_at": None,
+                        "paused_reason": None,
+                    })
+
+                # Release lock before touching wake file — ticker will see
+                # the updated next_run_at when it wakes.
+                try:
+                    from hermes_constants import get_hermes_home
+                    _wake = get_hermes_home() / "cron" / ".cron.wake"
+                    _wake.parent.mkdir(parents=True, exist_ok=True)
+                    _wake.touch()
+                except Exception as exc:
+                    logger.warning("Failed to create cron wake file: %s", exc)
+
+                return json.dumps({
+                    "success": True,
+                    "job": _format_job(get_job(job_id)),
+                    "message": "Job triggered. Will execute within seconds.",
+                }, indent=2)
+
+            # ── CLI mode: synchronous execution, user sees result directly ──
+            with open(_LOCK_FILE, "w") as _lock_fd:
+                fcntl.flock(_lock_fd, fcntl.LOCK_EX)
+
+                # Clear paused state so the job is eligible to run.
+                # Don't set next_run_at or state — run_job() executes
+                # immediately and mark_job_run() will compute the real
+                # next_run_at afterward.
+                update_job(job_id, {
+                    "enabled": True,
+                    "paused_at": None,
+                    "paused_reason": None,
+                })
+
+                _job = get_job(job_id)
+                try:
+                    success, output, final_response, error = run_job(_job)
+                    save_job_output(job_id, output)
+                except Exception as exc:
+                    logger.error("CLI cron run failed for %s: %s", job_id, exc)
+                    success = False
+                    final_response = None
+                    error = str(exc)
+                    output = ""
+
+                mark_job_run(job_id, success, error)
+
+            return json.dumps({
+                "success": success,
+                "job": _format_job(get_job(job_id)),
+                "output_preview": final_response[:500] if final_response else None,
+            }, indent=2)
 
         if normalized == "update":
             updates: Dict[str, Any] = {}
