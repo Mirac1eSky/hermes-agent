@@ -11814,7 +11814,17 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
             except Exception as e:
                 logger.debug("Curator tick error: %s", e)
 
-        stop_event.wait(timeout=interval)
+        # Check for external wake signal (e.g. `cronjob run` from CLI or API)
+        # so the ticker responds to manual triggers within ~1s instead of
+        # waiting up to `interval` seconds.
+        _wake_file = _hermes_home / "cron" / ".cron.wake"
+        for _ in range(interval):
+            if _wake_file.exists():
+                _wake_file.unlink(missing_ok=True)
+                logger.debug("Cron ticker woken by external signal")
+                break
+            if stop_event.wait(timeout=1):
+                break  # stop requested
     logger.info("Cron ticker stopped")
 
 
